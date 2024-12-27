@@ -8,16 +8,29 @@ export async function onRequest(context) {
       next, // used for middleware or to fetch assets
       data, // arbitrary space for passing data between middlewares
     } = context;
-    console.log(env)
-    console.log(params.id)
+    // 组装 CDN URL
+    const url = new URL(request.url);
+    const cdnUrl = `https://${url.hostname}/file/${params.id}`;
+
+    // 解码params.id
+    params.id = decodeURIComponent(params.id);
+
     //read the metadata
     const value = await env.img_url.getWithMetadata(params.id);
-    console.log(value)
-    //"metadata":{"TimeStamp":19876541,"ListType":"None","rating_label":"None"}
+
     //change the metadata
     value.metadata.ListType = "White"
     await env.img_url.put(params.id,"",{metadata: value.metadata});
     const info = JSON.stringify(value.metadata);
+
+    // 清除CDN缓存
+    const options = {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Auth-Email': `${env.CF_EMAIL}`, 'X-Auth-Key': `${env.CF_API_KEY}`},
+      body: `{"files":["${ cdnUrl }"]}`
+    };
+    await fetch(`https://api.cloudflare.com/client/v4/zones/${ env.CF_ZONE_ID }/purge_cache`, options);
+
     return new Response(info);
 
   }

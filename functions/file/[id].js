@@ -9,7 +9,14 @@ export async function onRequest(context) {  // Contents of context object
         next, // used for middleware or to fetch assets
         data, // arbitrary space for passing data between middlewares
     } = context;
-    const TgFileID = params.id.split('.')[0]; // 文件 ID
+
+    try {
+        // 解码params.id
+        params.id = decodeURIComponent(params.id);
+    } catch (e) {
+        return new Response('Error: Decode Image ID Failed', { status: 400 });
+    }
+    
     const url = new URL(request.url);
     let Referer = request.headers.get('Referer')
     if (Referer) {
@@ -22,11 +29,11 @@ export async function onRequest(context) {  // Contents of context object
                     return domainPattern.test(refererUrl.hostname);
                 });
                 if (!isAllowed) {
-                    return Response.redirect(new URL("/block-img.html", request.url).href, 302); // Ensure URL is correctly formed
+                    return Response.redirect(new URL("/blockimg", request.url).href, 302); // Ensure URL is correctly formed
                 }
             }
         } catch (e) {
-            return Response.redirect(new URL("/block-img.html", request.url).href, 302); // Ensure URL is correctly formed
+            return Response.redirect(new URL("/blockimg", request.url).href, 302); // Ensure URL is correctly formed
         }
     }
     // 检查是否配置了 KV 数据库
@@ -34,22 +41,108 @@ export async function onRequest(context) {  // Contents of context object
         return new Response('Error: Please configure KV database', { status: 500 });
     }
     const imgRecord = await env.img_url.getWithMetadata(params.id);
+    // 如果meatdata不存在，只可能是之前未设置KV，且存储在Telegraph上的图片，那么在后面获取时会返回404错误，此处不用处理
+    
+    const fileName = imgRecord.metadata?.FileName || params.id;
+    const encodedFileName = encodeURIComponent(fileName);
+    const fileType = imgRecord.metadata?.FileType || null;
+    
+    // 检查文件可访问状态
+    let accessRes = await returnWithCheck(request, env, url, imgRecord);
+    if (accessRes.status !== 200) {
+        return accessRes; // 如果不可访问，直接返回
+    }
 
+
+
+    // Cloudflare R2渠道
+    if (imgRecord.metadata?.Channel === 'CloudflareR2') {
+        // 检查是否配置了R2
+        if (typeof env.img_r2 == "undefined" || env.img_r2 == null || env.img_r2 == "") {
+            return new Response('Error: Please configure R2 database', { status: 500 });
+        }
+        
+        const R2DataBase = env.img_r2;
+        const object = await R2DataBase.get(params.id);
+
+        if (object === null) {
+            return new Response('Error: Failed to fetch image', { status: 500 });
+        }
+
+        const headers = new Headers();
+        object.writeHttpMetadata(headers)
+        headers.set('Content-Disposition', `inline; filename="${encodedFileName}"; filename*=UTF-8''${encodedFileName}`);
+        headers.set('Access-Control-Allow-Origin', '*');
+        if (fileType) {
+            headers.set('Content-Type', fileType);
+        }
+        // 根据Referer设置CDN缓存策略，如果是从/或/dashboard等访问，则仅允许浏览器缓存；否则设置为public，缓存时间为7天
+        if (Referer && Referer.includes(url.origin)) {
+            headers.set('Cache-Control', 'private, max-age=86400');
+        } else {
+            headers.set('Cache-Control', 'public, max-age=604800');
+        }
+
+        // 返回图片
+        const newRes = new Response(object.body, {
+            status: 200,
+            headers,
+        });
+
+        return newRes;
+    }
+
+
+
+    
+    // Telegram及Telegraph渠道
+    let TgFileID = ''; // Tg的file_id
     if (imgRecord.metadata?.Channel === 'Telegram') {
-        targetUrl = `https://api.telegram.org/file/bot${env.TG_BOT_TOKEN}/${imgRecord.metadata.TgFilePath}`;
+        // id为file_id + ext
+        TgFileID = params.id.split('.')[0];
+    } else if (imgRecord.metadata?.Channel === 'TelegramNew') {
+        // id为unique_id + file_name
+        TgFileID = imgRecord.metadata?.TgFileId;
+        if (TgFileID === null) {
+            return new Response('Error: Failed to fetch image', { status: 500 });
+        }
+    } else {
+        // 旧版telegraph
+    }
+
+    // 构建目标 URL
+    if (isTgChannel(imgRecord)) {
+        // 获取TG图片真实地址
+        const filePath = await getFilePath(env, TgFileID);
+        if (filePath === null) {
+            return new Response('Error: Failed to fetch image path', { status: 500 });
+        }
+        targetUrl = `https://api.telegram.org/file/bot${env.TG_BOT_TOKEN}/${filePath}`;
     } else {
         targetUrl = 'https://telegra.ph/' + url.pathname + url.search;
     }
-    const fileName = imgRecord.metadata?.FileName || 'file';
-    const encodedFileName = encodeURIComponent(fileName);
-    const fileType = imgRecord.metadata?.FileType || 'image/jpeg';
 
-    const response = await getFileContent(request, imgRecord, TgFileID, env, url);
+    const response = await getFileContent(request);
+    if (response === null) {
+        return new Response('Error: Failed to fetch image', { status: 500 });
+    } else if (response.status === 404) {
+        return await return404(url);
+    }
     
     try {
         const headers = new Headers(response.headers);
-        headers.set('Content-Disposition', `inline; filename="${encodedFileName}"`);
-        headers.set('Content-Type', fileType);
+        headers.set('Content-Disposition', `inline; filename="${encodedFileName}"; filename*=UTF-8''${encodedFileName}`);
+        headers.set('Access-Control-Allow-Origin', '*');
+        if (fileType) {
+            headers.set('Content-Type', fileType);
+        }
+        // 根据Referer设置CDN缓存策略，如果是从/或/dashboard等访问，则仅允许浏览器缓存；否则设置为public，缓存时间为7天
+        if (Referer && Referer.includes(url.origin)) {
+            headers.set('Cache-Control', 'private, max-age=86400');
+        } else {
+            headers.set('Cache-Control', 'public, max-age=604800');
+        }
+
         const newRes =  new Response(response.body, {
             status: response.status,
             statusText: response.statusText,
@@ -57,46 +150,7 @@ export async function onRequest(context) {  // Contents of context object
         });
 
         if (response.ok) {
-            // Referer header equal to the admin page
-            if (request.headers.get('Referer') == url.origin + "/admin") {
-                //show the image
-                return newRes;
-            }
-
-            if (typeof env.img_url == "undefined" || env.img_url == null || env.img_url == "") { } else {
-                //check the record from kv
-                const record = await env.img_url.getWithMetadata(params.id);
-                if (record.metadata === null) {
-                } else {
-                    //if the record is not null, redirect to the image
-                    if (record.metadata.ListType == "White") {
-                        return newRes;
-                    } else if (record.metadata.ListType == "Block") {
-                        console.log("Referer")
-                        console.log(request.headers.get('Referer'))
-                        if (typeof request.headers.get('Referer') == "undefined" || request.headers.get('Referer') == null || request.headers.get('Referer') == "") {
-                            return Response.redirect(url.origin + "/block-img.html", 302)
-                        } else {
-                            return Response.redirect("https://static-res.pages.dev/teleimage/img-block-compressed.png", 302)
-                        }
-
-                    } else if (record.metadata.Label == "adult") {
-                        if (typeof request.headers.get('Referer') == "undefined" || request.headers.get('Referer') == null || request.headers.get('Referer') == "") {
-                            return Response.redirect(url.origin + "/block-img.html", 302)
-                        } else {
-                            return Response.redirect("https://static-res.pages.dev/teleimage/img-block-compressed.png", 302)
-                        }
-                    }
-                    //check if the env variables WhiteList_Mode are set
-                    if (env.WhiteList_Mode == "true") {
-                        //if the env variables WhiteList_Mode are set, redirect to the image
-                        return Response.redirect(url.origin + "/whitelist-on.html", 302);
-                    } else {
-                        //if the env variables WhiteList_Mode are not set, redirect to the image
-                        return newRes;
-                    }
-                }
-            }
+            return newRes;
         }
         return newRes;
     } catch (error) {
@@ -104,7 +158,43 @@ export async function onRequest(context) {  // Contents of context object
     }
 }
 
-async function getFileContent(request, imgRecord, file_id, env, url, max_retries = 2) {
+async function returnWithCheck(request, env, url, imgRecord) {
+    const response = new Response('good', { status: 200 });
+
+    // Referer header equal to the dashboard page or upload page
+    if (request.headers.get('Referer') && request.headers.get('Referer').includes(url.origin)) {
+        //show the image
+        return response;
+    }
+
+    if (typeof env.img_url == "undefined" || env.img_url == null || env.img_url == "") { } else {
+        //check the record from kv
+        const record = imgRecord;
+        if (record.metadata === null) {
+        } else {
+            //if the record is not null, redirect to the image
+            if (record.metadata.ListType == "White") {
+                return response;
+            } else if (record.metadata.ListType == "Block") {
+                return await returnBlockImg(url);
+            } else if (record.metadata.Label == "adult") {
+                return await returnBlockImg(url);
+            }
+            //check if the env variables WhiteList_Mode are set
+            if (env.WhiteList_Mode == "true") {
+                //if the env variables WhiteList_Mode are set, redirect to the image
+                return await returnWhiteListImg(url);
+            } else {
+                //if the env variables WhiteList_Mode are not set, redirect to the image
+                return response;
+            }
+        }
+    }
+    // other cases
+    return response;
+}
+
+async function getFileContent(request, max_retries = 2) {
     let retries = 0;
     while (retries <= max_retries) {
         try {
@@ -115,23 +205,9 @@ async function getFileContent(request, imgRecord, file_id, env, url, max_retries
             });
             if (response.ok || response.status === 304) {
                 return response;
+            } else if (response.status === 404) {
+                return new Response('Error: Image Not Found', { status: 404 });
             } else {
-                // 若为TG渠道，更新TgFilePath
-                if (imgRecord.metadata?.Channel === 'Telegram') {
-                    const filePath = await getFilePath(env, file_id);
-                    if (filePath) {
-                        imgRecord.metadata.TgFilePath = filePath;
-                        await env.img_url.put(file_id, "", {
-                            metadata: imgRecord.metadata,
-                        });
-                        // 更新targetUrl
-                        if (imgRecord.metadata?.Channel === 'Telegram') {
-                            targetUrl = `https://api.telegram.org/file/bot${env.TG_BOT_TOKEN}/${imgRecord.metadata.TgFilePath}`;
-                        } else {
-                            targetUrl = 'https://telegra.ph/' + url.pathname + url.search;
-                        }
-                    }
-                }
                 retries++;
             }
         } catch (error) {
@@ -161,4 +237,75 @@ async function getFilePath(env, file_id) {
       } catch (error) {
         return null;
       }
+}
+
+function isTgChannel(imgRecord) {
+    return imgRecord.metadata?.Channel === 'Telegram' || imgRecord.metadata?.Channel === 'TelegramNew';
+}
+
+async function return404(url) {
+    const Img404 = await fetch(url.origin + "/static/404.png");
+    if (!Img404.ok) {
+        return new Response('Error: Image Not Found',
+            {
+                status: 404,
+                headers: {
+                    "Cache-Control": "public, max-age=86400"
+                }
+            }
+        );
+    } else {
+        return new Response(Img404.body, {
+            status: 404,
+            headers: {
+                "Content-Type": "image/png",
+                "Content-Disposition": "inline",
+                "Cache-Control": "public, max-age=86400",
+            },
+        });
+    }
+}
+
+async function returnBlockImg(url) {
+    const blockImg = await fetch(url.origin + "/static/BlockImg.png");
+    if (!blockImg.ok) {
+        return new Response(null, {
+            status: 302,
+            headers: {
+                "Location": url.origin + "/blockimg",
+                "Cache-Control": "public, max-age=86400"
+            }
+        })
+    } else {
+        return new Response(blockImg.body, {
+            status: 403,
+            headers: {
+                "Content-Type": "image/png",
+                "Content-Disposition": "inline",
+                "Cache-Control": "public, max-age=86400",
+            },
+        });
+    }
+}
+
+async function returnWhiteListImg(url) {
+    const WhiteListImg = await fetch(url.origin + "/static/WhiteListOn.png");
+    if (!WhiteListImg.ok) {
+        return new Response(null, {
+            status: 302,
+            headers: {
+                "Location": url.origin + "/whiteliston",
+                "Cache-Control": "public, max-age=86400"
+            }
+        })
+    } else {
+        return new Response(WhiteListImg.body, {
+            status: 200,
+            headers: {
+                "Content-Type": "image/png",
+                "Content-Disposition": "inline",
+                "Cache-Control": "public, max-age=86400",
+            },
+        });
+    }
 }
